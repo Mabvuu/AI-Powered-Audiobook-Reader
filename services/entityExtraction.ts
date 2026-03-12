@@ -1,4 +1,4 @@
-import { prisma } from "@/lib/prisma";
+import { supabase } from "@/lib/supabase";
 import { openai } from "@/lib/openai";
 
 type ExtractedCharacter = {
@@ -33,12 +33,37 @@ type ChapterExtractionResult = {
   relationships: ExtractedRelationship[];
 };
 
+type BookRow = {
+  id: string;
+  title: string;
+};
+
+type ChapterRow = {
+  id: string;
+  title: string;
+  text: string;
+  chapter_order: number;
+};
+
+type CharacterRow = {
+  id: string;
+  name: string;
+};
+
 function safeJsonParse<T>(value: string): T {
   try {
     return JSON.parse(value) as T;
   } catch {
     throw new Error("Model returned invalid JSON.");
   }
+}
+
+function cleanName(value: string) {
+  return value.trim();
+}
+
+function cleanType(value: string) {
+  return value.trim().toLowerCase();
 }
 
 async function extractChapterData(
@@ -111,161 +136,287 @@ ${trimmedText}
   return safeJsonParse<ChapterExtractionResult>(text);
 }
 
-export async function extractEntitiesForBook(bookId: string) {
-  const book = await prisma.book.findUnique({
-    where: { id: bookId },
-    include: {
-      chapters: {
-        orderBy: { createdAt: "asc" },
-      },
-    },
-  });
+async function getBook(bookId: string): Promise<BookRow> {
+  const { data, error } = await supabase
+    .from("books")
+    .select("id, title")
+    .eq("id", bookId)
+    .single();
 
-  if (!book) {
+  if (error || !data) {
     throw new Error("Book not found.");
   }
 
-  for (const chapter of book.chapters) {
-    const chapterText =
-      (chapter as { content?: string; text?: string }).content ||
-      (chapter as { content?: string; text?: string }).text ||
-      "";
+  return data as BookRow;
+}
+
+async function getBookChapters(bookId: string): Promise<ChapterRow[]> {
+  const { data, error } = await supabase
+    .from("chapters")
+    .select("id, title, text, chapter_order")
+    .eq("book_id", bookId)
+    .order("chapter_order", { ascending: true });
+
+  if (error) {
+    throw new Error(`Failed to load chapters: ${error.message}`);
+  }
+
+  return (data || []) as ChapterRow[];
+}
+
+async function upsertCharacter(params: {
+  bookId: string;
+  chapterId: string;
+  character: ExtractedCharacter;
+}): Promise<CharacterRow> {
+  const name = cleanName(params.character.name);
+
+  const payload = {
+    book_id: params.bookId,
+    name,
+    aliases:
+      params.character.aliases && params.character.aliases.length > 0
+        ? params.character.aliases
+        : null,
+    description: params.character.description || null,
+    first_appearance_chapter_id: params.chapterId,
+    metadata: {
+      source: "ai-extraction",
+    },
+    updated_at: new Date().toISOString(),
+  };
+
+  const { data, error } = await supabase
+    .from("characters")
+    .upsert(payload, {
+      onConflict: "book_id,name",
+      ignoreDuplicates: false,
+    })
+    .select("id, name")
+    .single();
+
+  if (error || !data) {
+    throw new Error(`Failed to save character "${name}": ${error?.message}`);
+  }
+
+  return data as CharacterRow;
+}
+
+async function createCharacterMention(params: {
+  characterId: string;
+  chapterId: string;
+  quote?: string;
+  context?: string;
+}) {
+  if (!params.quote && !params.context) return;
+
+  const { error } = await supabase.from("character_mentions").insert({
+    character_id: params.characterId,
+    chapter_id: params.chapterId,
+    quote: params.quote || null,
+    context: params.context || null,
+  });
+
+  if (error) {
+    throw new Error(`Failed to save character mention: ${error.message}`);
+  }
+}
+
+async function upsertPlace(params: {
+  bookId: string;
+  chapterId: string;
+  place: ExtractedPlace;
+}) {
+  const name = cleanName(params.place.name);
+
+  const { error } = await supabase.from("places").upsert(
+    {
+      book_id: params.bookId,
+      name,
+      description: params.place.description || null,
+      first_appearance_chapter_id: params.chapterId,
+      updated_at: new Date().toISOString(),
+    },
+    {
+      onConflict: "book_id,name",
+      ignoreDuplicates: false,
+    }
+  );
+
+  if (error) {
+    throw new Error(`Failed to save place "${name}": ${error.message}`);
+  }
+}
+
+async function createStoryEvent(params: {
+  bookId: string;
+  chapterId: string;
+  event: ExtractedEvent;
+}) {
+  const { error } = await supabase.from("story_events").insert({
+    book_id: params.bookId,
+    chapter_id: params.chapterId,
+    title: params.event.title.trim(),
+    summary: params.event.summary || null,
+    metadata: {
+      source: "ai-extraction",
+    },
+    updated_at: new Date().toISOString(),
+  });
+
+  if (error) {
+    throw new Error(`Failed to save story event: ${error.message}`);
+  }
+}
+
+async function findCharacterByName(
+  bookId: string,
+  name: string
+): Promise<CharacterRow | null> {
+  const { data, error } = await supabase
+    .from("characters")
+    .select("id, name")
+    .eq("book_id", bookId)
+    .eq("name", cleanName(name))
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Failed to find character "${name}": ${error.message}`);
+  }
+
+  return (data as CharacterRow | null) || null;
+}
+
+async function upsertRelationship(params: {
+  bookId: string;
+  fromCharacterId: string;
+  toCharacterId: string;
+  relationship: ExtractedRelationship;
+}) {
+  const { error } = await supabase.from("character_relationships").upsert(
+    {
+      book_id: params.bookId,
+      from_character_id: params.fromCharacterId,
+      to_character_id: params.toCharacterId,
+      type: cleanType(params.relationship.type),
+      description: params.relationship.description || null,
+      metadata: {
+        source: "ai-extraction",
+      },
+      updated_at: new Date().toISOString(),
+    },
+    {
+      onConflict: "book_id,from_character_id,to_character_id,type",
+      ignoreDuplicates: false,
+    }
+  );
+
+  if (error) {
+    throw new Error(`Failed to save relationship: ${error.message}`);
+  }
+}
+
+export async function extractEntitiesForBook(bookId: string) {
+  await getBook(bookId);
+  const chapters = await getBookChapters(bookId);
+
+  if (chapters.length === 0) {
+    throw new Error("No chapters found for this book.");
+  }
+
+  const characterCache = new Map<string, string>();
+
+  for (const chapter of chapters) {
+    const chapterText = chapter.text || "";
 
     if (!chapterText.trim()) {
       continue;
     }
 
     const extracted = await extractChapterData(
-      (chapter as { title?: string }).title || "Untitled Chapter",
+      chapter.title || "Untitled Chapter",
       chapterText
     );
 
-    const characterMap = new Map<string, string>();
-
     for (const character of extracted.characters) {
-      const savedCharacter = await prisma.character.upsert({
-        where: {
-          bookId_name: {
-            bookId,
-            name: character.name.trim(),
-          },
-        },
-        update: {
-          description: character.description || undefined,
-          aliases: character.aliases && character.aliases.length > 0 ? character.aliases : undefined,
-          metadata: {
-            source: "ai-extraction",
-          },
-          ...(character.description
-            ? { description: character.description }
-            : {}),
-        },
-        create: {
-          bookId,
-          name: character.name.trim(),
-          aliases: character.aliases && character.aliases.length > 0 ? character.aliases : undefined,
-          description: character.description || null,
-          firstAppearanceChapterId: chapter.id,
-          metadata: {
-            source: "ai-extraction",
-          },
-        },
+      if (!character.name?.trim()) continue;
+
+      const savedCharacter = await upsertCharacter({
+        bookId,
+        chapterId: chapter.id,
+        character,
       });
 
-      characterMap.set(savedCharacter.name, savedCharacter.id);
+      characterCache.set(savedCharacter.name, savedCharacter.id);
 
-      if (character.quote || character.context) {
-        await prisma.characterMention.create({
-          data: {
-            characterId: savedCharacter.id,
-            chapterId: chapter.id,
-            quote: character.quote || null,
-            context: character.context || null,
-          },
-        });
-      }
+      await createCharacterMention({
+        characterId: savedCharacter.id,
+        chapterId: chapter.id,
+        quote: character.quote,
+        context: character.context,
+      });
     }
 
     for (const place of extracted.places) {
-      await prisma.place.upsert({
-        where: {
-          bookId_name: {
-            bookId,
-            name: place.name.trim(),
-          },
-        },
-        update: {
-          ...(place.description ? { description: place.description } : {}),
-        },
-        create: {
-          bookId,
-          name: place.name.trim(),
-          description: place.description || null,
-          firstAppearanceChapterId: chapter.id,
-        },
+      if (!place.name?.trim()) continue;
+
+      await upsertPlace({
+        bookId,
+        chapterId: chapter.id,
+        place,
       });
     }
 
     for (const event of extracted.events) {
-      await prisma.storyEvent.create({
-        data: {
-          bookId,
-          chapterId: chapter.id,
-          title: event.title.trim(),
-          summary: event.summary || null,
-          metadata: {
-            source: "ai-extraction",
-          },
-        },
+      if (!event.title?.trim()) continue;
+
+      await createStoryEvent({
+        bookId,
+        chapterId: chapter.id,
+        event,
       });
     }
 
     for (const relationship of extracted.relationships) {
-      const fromCharacter = await prisma.character.findUnique({
-        where: {
-          bookId_name: {
-            bookId,
-            name: relationship.from.trim(),
-          },
-        },
-      });
+      if (
+        !relationship.from?.trim() ||
+        !relationship.to?.trim() ||
+        !relationship.type?.trim()
+      ) {
+        continue;
+      }
 
-      const toCharacter = await prisma.character.findUnique({
-        where: {
-          bookId_name: {
-            bookId,
-            name: relationship.to.trim(),
-          },
-        },
-      });
+      const fromName = cleanName(relationship.from);
+      const toName = cleanName(relationship.to);
 
-      if (!fromCharacter || !toCharacter) continue;
+      let fromCharacterId = characterCache.get(fromName);
+      let toCharacterId = characterCache.get(toName);
 
-      await prisma.characterRelationship.upsert({
-        where: {
-          bookId_fromCharacterId_toCharacterId_type: {
-            bookId,
-            fromCharacterId: fromCharacter.id,
-            toCharacterId: toCharacter.id,
-            type: relationship.type.trim().toLowerCase(),
-          },
-        },
-        update: {
-          description: relationship.description || null,
-          metadata: {
-            source: "ai-extraction",
-          },
-        },
-        create: {
-          bookId,
-          fromCharacterId: fromCharacter.id,
-          toCharacterId: toCharacter.id,
-          type: relationship.type.trim().toLowerCase(),
-          description: relationship.description || null,
-          metadata: {
-            source: "ai-extraction",
-          },
-        },
+      if (!fromCharacterId) {
+        const foundFrom = await findCharacterByName(bookId, fromName);
+        if (foundFrom) {
+          fromCharacterId = foundFrom.id;
+          characterCache.set(foundFrom.name, foundFrom.id);
+        }
+      }
+
+      if (!toCharacterId) {
+        const foundTo = await findCharacterByName(bookId, toName);
+        if (foundTo) {
+          toCharacterId = foundTo.id;
+          characterCache.set(foundTo.name, foundTo.id);
+        }
+      }
+
+      if (!fromCharacterId || !toCharacterId) {
+        continue;
+      }
+
+      await upsertRelationship({
+        bookId,
+        fromCharacterId,
+        toCharacterId,
+        relationship,
       });
     }
   }

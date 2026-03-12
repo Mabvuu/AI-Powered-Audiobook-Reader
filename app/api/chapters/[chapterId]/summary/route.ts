@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { prisma } from "../../../../../lib/prisma";
-import { openai } from "../../../../../lib/openai";
+import { supabase } from "@/lib/supabase";
+import { openai } from "@/lib/openai";
 
 type RouteContext = {
   params: Promise<{
@@ -8,29 +8,53 @@ type RouteContext = {
   }>;
 };
 
+type ChapterRow = {
+  id: string;
+  title: string;
+  text: string;
+  summary: string | null;
+};
+
 export async function POST(_request: NextRequest, context: RouteContext) {
   try {
     const { chapterId } = await context.params;
 
-    const chapter = await prisma.chapter.findUnique({
-      where: { id: chapterId },
-    });
+    const { data: chapter, error: chapterError } = await supabase
+      .from("chapters")
+      .select("id, title, text, summary")
+      .eq("id", chapterId)
+      .single();
 
-    if (!chapter) {
+    if (chapterError || !chapter) {
       return NextResponse.json({ error: "Chapter not found" }, { status: 404 });
     }
 
+    const chapterData = chapter as ChapterRow;
+
     const response = await openai.responses.create({
-      model: "gpt-4.1-mini",
-      input: `Summarize this chapter in 4 short bullet points and then 1 short paragraph:\n\nTitle: ${chapter.title}\n\nText:\n${chapter.text.slice(0, 12000)}`,
+      model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+      input: `Summarize this chapter in 4 short bullet points and then 1 short paragraph:
+
+Title: ${chapterData.title}
+
+Text:
+${chapterData.text.slice(0, 12000)}`,
     });
 
-    const summary = response.output_text || "No summary generated.";
+    const summary = response.output_text?.trim() || "No summary generated.";
 
-    const updatedChapter = await prisma.chapter.update({
-      where: { id: chapterId },
-      data: { summary },
-    });
+    const { data: updatedChapter, error: updateError } = await supabase
+      .from("chapters")
+      .update({ summary })
+      .eq("id", chapterId)
+      .select("id, summary")
+      .single();
+
+    if (updateError || !updatedChapter) {
+      throw new Error(
+        `Failed to update chapter summary: ${updateError?.message || "Unknown error"}`
+      );
+    }
 
     return NextResponse.json({
       chapterId: updatedChapter.id,
