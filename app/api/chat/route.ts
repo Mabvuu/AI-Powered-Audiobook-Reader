@@ -1,63 +1,60 @@
 import { NextRequest, NextResponse } from "next/server";
 import { supabase } from "@/lib/supabase";
 import { openai } from "@/lib/openai";
+import { generateEmbedding } from "@/services/embeddings";
+import { searchBookChunks, ChunkMatch } from "@/services/vector-search";
 
 type ChatBody = {
-  userId: string;
+  userId?: string;
   bookId: string;
   sessionId?: string;
   question: string;
 };
 
-type ChapterMatch = {
-  id: string;
-  title: string;
-  text: string;
-  chapter_order: number;
-};
-
 type PreviousMessage = {
-  role: string;
+  role: "user" | "assistant";
   content: string;
 };
 
 type ChatSessionRow = {
   id: string;
-  user_id: string;
   book_id: string;
   title: string | null;
 };
 
 type ChatMessageRow = {
   id: string;
-  chat_session_id: string;
-  role: string;
+  session_id: string;
+  role: "user" | "assistant" | "system";
   content: string;
-  source_chapter: string | null;
-  created_at: string;
+  created_at: string | null;
 };
+
+type SupabaseLike = typeof supabase;
 
 export async function POST(request: NextRequest) {
   try {
     const body = (await request.json()) as ChatBody;
-    const { userId, bookId, sessionId, question } = body;
+    const { bookId, sessionId, question } = body;
+    const cleanQuestion = question?.trim();
 
-    if (!userId || !bookId || !question?.trim()) {
+    if (!bookId || !cleanQuestion) {
       return NextResponse.json(
-        { error: "userId, bookId and question are required" },
+        { error: "bookId and question are required" },
         { status: 400 }
       );
     }
+
+    const db = supabase as SupabaseLike;
 
     let session: ChatSessionRow | null = null;
     let previousMessages: PreviousMessage[] = [];
 
     if (sessionId) {
-      const { data: existingSession, error: sessionError } = await supabase
+      const { data: existingSession, error: sessionError } = await db
         .from("chat_sessions")
-        .select("id, user_id, book_id, title")
+        .select("id, book_id, title")
         .eq("id", sessionId)
-        .eq("user_id", userId)
         .eq("book_id", bookId)
         .maybeSingle();
 
@@ -66,12 +63,12 @@ export async function POST(request: NextRequest) {
       }
 
       if (existingSession) {
-        session = existingSession as ChatSessionRow;
+        session = existingSession as unknown as ChatSessionRow;
 
-        const { data: messages, error: messagesError } = await supabase
+        const { data: messages, error: messagesError } = await db
           .from("chat_messages")
-          .select("id, chat_session_id, role, content, source_chapter, created_at")
-          .eq("chat_session_id", session.id)
+          .select("id, session_id, role, content, created_at")
+          .eq("session_id", session.id)
           .order("created_at", { ascending: true })
           .limit(10);
 
@@ -79,63 +76,64 @@ export async function POST(request: NextRequest) {
           throw new Error(`Failed to load chat messages: ${messagesError.message}`);
         }
 
-        previousMessages = ((messages || []) as ChatMessageRow[]).map((message) => ({
-          role: message.role === "assistant" ? "assistant" : "user",
-          content: message.content,
-        }));
+        previousMessages = ((messages ?? []) as unknown as ChatMessageRow[]).map(
+          (message: ChatMessageRow) => ({
+            role: message.role === "assistant" ? "assistant" : "user",
+            content: message.content,
+          })
+        );
       }
     }
 
     if (!session) {
-      const { data: createdSession, error: createSessionError } = await supabase
+      const { data: createdSession, error: createSessionError } = await db
         .from("chat_sessions")
         .insert({
-          user_id: userId,
           book_id: bookId,
-          title: question.trim().slice(0, 60),
+          title: cleanQuestion.slice(0, 60),
         })
-        .select("id, user_id, book_id, title")
+        .select("id, book_id, title")
         .single();
 
       if (createSessionError || !createdSession) {
         throw new Error(
-          `Failed to create chat session: ${createSessionError?.message || "Unknown error"}`
+          `Failed to create chat session: ${
+            createSessionError?.message || "Unknown error"
+          }`
         );
       }
 
-      session = createdSession as ChatSessionRow;
+      session = createdSession as unknown as ChatSessionRow;
     }
 
-    const { data: chapterMatchesData, error: chaptersError } = await supabase
-      .from("chapters")
-      .select("id, title, text, chapter_order")
-      .eq("book_id", bookId)
-      .order("chapter_order", { ascending: true })
-      .limit(3);
-
-    if (chaptersError) {
-      throw new Error(`Failed to load chapters: ${chaptersError.message}`);
-    }
-
-    const chapterMatches = (chapterMatchesData || []) as ChapterMatch[];
-
-    const contextText = chapterMatches
-      .map(
-        (chapter) =>
-          `Chapter ${chapter.chapter_order}: ${chapter.title}\n${(chapter.text || "").slice(0, 2000)}`
-      )
-      .join("\n\n---\n\n");
-
-    const { error: saveUserMessageError } = await supabase.from("chat_messages").insert({
-      chat_session_id: session.id,
+    const { error: saveUserMessageError } = await db.from("chat_messages").insert({
+      session_id: session.id,
       role: "user",
-      content: question.trim(),
-      source_chapter: null,
+      content: cleanQuestion,
     });
 
     if (saveUserMessageError) {
       throw new Error(`Failed to save user message: ${saveUserMessageError.message}`);
     }
+
+    const questionEmbedding = await generateEmbedding(cleanQuestion);
+
+    const chunkMatches: ChunkMatch[] = await searchBookChunks({
+      bookId,
+      embedding: questionEmbedding,
+      matchCount: 6,
+    });
+
+    const contextText = chunkMatches
+      .map((chunk: ChunkMatch) => {
+        const chapterLabel =
+          chunk.chapter_order && chunk.chapter_title
+            ? `Chapter ${chunk.chapter_order}: ${chunk.chapter_title}`
+            : chunk.chapter_title || "Unknown chapter";
+
+        return `${chapterLabel} | Chunk ${chunk.chunk_order}\n${chunk.text}`;
+      })
+      .join("\n\n---\n\n");
 
     const response = await openai.responses.create({
       model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
@@ -143,46 +141,48 @@ export async function POST(request: NextRequest) {
         {
           role: "system",
           content:
-            "You answer questions about a book. Use the provided book context and previous conversation. Keep answers clear and short. If unsure, say you are not sure.",
+            "You answer questions about a book using the provided retrieved context. Keep the answer clear and short. If the answer is not in the context, say you are not sure.",
         },
-        ...previousMessages.map((message) => ({
-          role: message.role as "user" | "assistant",
+        ...previousMessages.map((message: PreviousMessage) => ({
+          role: message.role,
           content: message.content,
         })),
         {
           role: "user",
-          content: `Book context:\n${contextText}\n\nQuestion:\n${question.trim()}`,
+          content: chunkMatches.length
+            ? `Book context:\n${contextText}\n\nQuestion:\n${cleanQuestion}`
+            : `No matching book context was found.\n\nQuestion:\n${cleanQuestion}`,
         },
       ],
     });
 
     const answer = response.output_text?.trim() || "No answer generated.";
-    const firstSource = chapterMatches[0];
-    const sourceChapter = firstSource
-      ? `Chapter ${firstSource.chapter_order}: ${firstSource.title}`
-      : null;
 
-    const { data: savedAnswer, error: saveAnswerError } = await supabase
-      .from("chat_messages")
-      .insert({
-        chat_session_id: session.id,
-        role: "assistant",
-        content: answer,
-        source_chapter: sourceChapter,
-      })
-      .select("content, source_chapter")
-      .single();
+    const { error: saveAnswerError } = await db.from("chat_messages").insert({
+      session_id: session.id,
+      role: "assistant",
+      content: answer,
+    });
 
-    if (saveAnswerError || !savedAnswer) {
-      throw new Error(
-        `Failed to save assistant message: ${saveAnswerError?.message || "Unknown error"}`
-      );
+    if (saveAnswerError) {
+      throw new Error(`Failed to save assistant message: ${saveAnswerError.message}`);
     }
+
+    const sources = Array.from(
+      new Set(
+        chunkMatches.map((chunk: ChunkMatch) =>
+          chunk.chapter_order && chunk.chapter_title
+            ? `Chapter ${chunk.chapter_order}: ${chunk.chapter_title}`
+            : chunk.chapter_title || "Unknown chapter"
+        )
+      )
+    );
 
     return NextResponse.json({
       sessionId: session.id,
-      answer: savedAnswer.content,
-      sourceChapter: savedAnswer.source_chapter,
+      answer,
+      sources,
+      matchesFound: chunkMatches.length,
     });
   } catch (error) {
     console.error("CHAT_ERROR", error);

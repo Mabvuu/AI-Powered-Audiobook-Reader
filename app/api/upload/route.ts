@@ -5,6 +5,7 @@ import { createServerSupabaseClient } from "@/lib/supabase-server";
 import { extractText } from "@/services/textExtractor";
 import { splitIntoChapters } from "@/services/chapterSplitter";
 import { chunkText } from "@/utils/chunkText";
+import { generateEmbeddings } from "@/services/embeddings";
 
 type InsertedBook = {
   id: string;
@@ -22,6 +23,31 @@ type InsertedChapter = {
   text: string;
   summary: string | null;
   created_at: string | null;
+};
+
+type RawChunk = {
+  book_id: string;
+  chapter_id: string;
+  chunk_order: number;
+  text: string;
+};
+
+type ChunkInsertRow = {
+  book_id: string;
+  chapter_id: string;
+  chunk_order: number;
+  text: string;
+  embedding: number[];
+};
+
+type SupabaseServerClient = ReturnType<typeof createServerSupabaseClient>;
+
+type ChunksInsertClient = {
+  from: (table: "chunks") => {
+    insert: (
+      values: ChunkInsertRow[]
+    ) => Promise<{ error: { message: string } | null }>;
+  };
 };
 
 export async function POST(req: NextRequest) {
@@ -42,14 +68,24 @@ export async function POST(req: NextRequest) {
       fs.mkdirSync(uploadDir, { recursive: true });
     }
 
-    const filePath = path.join(uploadDir, file.name);
+    const safeFileName = `${Date.now()}-${file.name.replace(/\s+/g, "-")}`;
+    const filePath = path.join(uploadDir, safeFileName);
     fs.writeFileSync(filePath, buffer);
 
     const supabase = createServerSupabaseClient();
+    const db = supabase as SupabaseServerClient;
+
     const title = file.name.replace(/\.[^/.]+$/, "");
     const fullText = await extractText(filePath);
 
-    const { data: insertedBook, error: bookError } = await supabase
+    if (!fullText?.trim()) {
+      return NextResponse.json(
+        { error: "Could not extract text from file" },
+        { status: 400 }
+      );
+    }
+
+    const { data: insertedBook, error: bookError } = await db
       .from("books")
       .insert({
         title,
@@ -66,7 +102,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const book = insertedBook as InsertedBook;
+    const book = insertedBook as unknown as InsertedBook;
 
     const chapterPayload = splitIntoChapters(fullText).map((chapter) => ({
       book_id: book.id,
@@ -79,7 +115,7 @@ export async function POST(req: NextRequest) {
     let insertedChapters: InsertedChapter[] = [];
 
     if (chapterPayload.length > 0) {
-      const { data: chapterRows, error: chaptersError } = await supabase
+      const { data: chapterRows, error: chaptersError } = await db
         .from("chapters")
         .insert(chapterPayload)
         .select("id, book_id, title, chapter_order, text, summary, created_at");
@@ -91,32 +127,55 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      insertedChapters = (chapterRows ?? []) as InsertedChapter[];
+      insertedChapters = (chapterRows ?? []) as unknown as InsertedChapter[];
     }
 
-    const chunkPayload = insertedChapters.flatMap((chapter) => {
-      const chunks = chunkText(chapter.text);
+    const rawChunks: RawChunk[] = insertedChapters.flatMap(
+      (chapter: InsertedChapter) => {
+        const chunks = chunkText(chapter.text)
+          .map((chunk: string) => chunk.trim())
+          .filter(Boolean);
 
-      return chunks.map((chunk, index) => ({
-        book_id: book.id,
-        chapter_id: chapter.id,
-        chunk_order: index + 1,
-        text: chunk,
-        embedding: null,
-      }));
-    });
-
-    if (chunkPayload.length > 0) {
-      const { error: chunksError } = await supabase
-        .from("chunks")
-        .insert(chunkPayload);
-
-      if (chunksError) {
-        return NextResponse.json(
-          { error: chunksError.message },
-          { status: 500 }
-        );
+        return chunks.map((chunk: string, index: number) => ({
+          book_id: book.id,
+          chapter_id: chapter.id,
+          chunk_order: index + 1,
+          text: chunk,
+        }));
       }
+    );
+
+    if (rawChunks.length === 0) {
+      return NextResponse.json({
+        success: true,
+        bookId: book.id,
+        chaptersCreated: insertedChapters.length,
+        chunksCreated: 0,
+      });
+    }
+
+    const embeddings = await generateEmbeddings(
+      rawChunks.map((chunk: RawChunk) => chunk.text)
+    );
+
+    const chunkPayload: ChunkInsertRow[] = rawChunks.map(
+      (chunk: RawChunk, index: number) => ({
+        book_id: chunk.book_id,
+        chapter_id: chunk.chapter_id,
+        chunk_order: chunk.chunk_order,
+        text: chunk.text,
+        embedding: embeddings[index],
+      })
+    );
+
+    const chunksDb = db as unknown as ChunksInsertClient;
+    const { error: chunksError } = await chunksDb.from("chunks").insert(chunkPayload);
+
+    if (chunksError) {
+      return NextResponse.json(
+        { error: chunksError.message },
+        { status: 500 }
+      );
     }
 
     return NextResponse.json({
@@ -126,7 +185,7 @@ export async function POST(req: NextRequest) {
       chunksCreated: chunkPayload.length,
     });
   } catch (error) {
-    console.error(error);
+    console.error("UPLOAD_ERROR", error);
     return NextResponse.json({ error: "Upload failed" }, { status: 500 });
   }
 }
