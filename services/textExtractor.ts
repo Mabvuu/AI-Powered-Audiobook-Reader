@@ -1,43 +1,40 @@
-import fs from "fs"
-import path from "path"
-import { createRequire } from "module"
-import EPub from "epub2"
-
-const require = createRequire(import.meta.url)
-const pdfParse = require("pdf-parse")
+import fs from "fs";
+import path from "path";
+import EPub from "epub2";
+import { extractText as extractPdfText, getDocumentProxy } from "unpdf";
 
 export async function extractText(filePath: string): Promise<string> {
-  const ext = path.extname(filePath).toLowerCase()
+  const ext = path.extname(filePath).toLowerCase();
 
   if (ext === ".pdf") {
-    const buffer = fs.readFileSync(filePath)
-    const data = await pdfParse(buffer)
-    return data.text
+    const buffer = fs.readFileSync(filePath);
+    const pdf = await getDocumentProxy(new Uint8Array(buffer));
+    const { text } = await extractPdfText(pdf, { mergePages: true });
+    return typeof text === "string" ? text.trim() : "";
   }
 
   if (ext === ".epub") {
     return new Promise((resolve, reject) => {
-      const epub = new EPub(filePath)
+      const epub = new EPub(filePath);
+      let text = "";
 
-      let text = ""
-
-      epub.on("error", reject)
+      epub.on("error", reject);
 
       epub.on("end", () => {
-        resolve(text)
-      })
+        resolve(text.trim());
+      });
 
       epub.on("chapter", (chapterText: string) => {
-        text += chapterText + "\n"
-      })
+        text += `${chapterText}\n`;
+      });
 
-      epub.parse()
-    })
+      epub.parse();
+    });
   }
 
   if (ext === ".txt") {
-    return fs.readFileSync(filePath, "utf8")
+    return fs.readFileSync(filePath, "utf8").trim();
   }
 
-  return ""
+  return "";
 }

@@ -1,10 +1,29 @@
-import { openai } from "@/lib/openai";
+import { pipeline } from "@huggingface/transformers";
 
-const EMBEDDING_MODEL =
-  process.env.OPENAI_EMBEDDING_MODEL || "text-embedding-3-small";
+type EmbeddingExtractor = (input: string, options?: {
+  pooling?: "mean";
+  normalize?: boolean;
+}) => Promise<{
+  data: Float32Array | number[];
+}>;
+
+let embedder: EmbeddingExtractor | null = null;
 
 function cleanText(text: string) {
   return text.replace(/\s+/g, " ").trim();
+}
+
+async function getEmbedder(): Promise<EmbeddingExtractor> {
+  if (!embedder) {
+    const extractor = await pipeline(
+      "feature-extraction",
+      "Xenova/all-MiniLM-L6-v2"
+    );
+
+    embedder = extractor as unknown as EmbeddingExtractor;
+  }
+
+  return embedder;
 }
 
 export async function generateEmbedding(text: string): Promise<number[]> {
@@ -14,12 +33,14 @@ export async function generateEmbedding(text: string): Promise<number[]> {
     throw new Error("Cannot generate embedding for empty text");
   }
 
-  const response = await openai.embeddings.create({
-    model: EMBEDDING_MODEL,
-    input,
+  const extractor = await getEmbedder();
+
+  const output = await extractor(input, {
+    pooling: "mean",
+    normalize: true,
   });
 
-  return response.data[0].embedding;
+  return Array.from(output.data);
 }
 
 export async function generateEmbeddings(texts: string[]): Promise<number[][]> {
@@ -29,10 +50,17 @@ export async function generateEmbeddings(texts: string[]): Promise<number[][]> {
     return [];
   }
 
-  const response = await openai.embeddings.create({
-    model: EMBEDDING_MODEL,
-    input: inputs,
-  });
+  const extractor = await getEmbedder();
+  const results: number[][] = [];
 
-  return response.data.map((item) => item.embedding);
+  for (const input of inputs) {
+    const output = await extractor(input, {
+      pooling: "mean",
+      normalize: true,
+    });
+
+    results.push(Array.from(output.data));
+  }
+
+  return results;
 }
