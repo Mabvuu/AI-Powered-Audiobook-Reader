@@ -22,6 +22,16 @@ type RpcChunkMatch = {
   chapter_order?: number | null;
 };
 
+type RpcClient = {
+  rpc: (
+    fn: string,
+    args?: Record<string, unknown>
+  ) => Promise<{
+    data: RpcChunkMatch[] | null;
+    error: { message: string } | null;
+  }>;
+};
+
 export async function searchBookChunks(params: {
   bookId: string;
   embedding: number[];
@@ -29,12 +39,15 @@ export async function searchBookChunks(params: {
 }): Promise<ChunkMatch[]> {
   const { bookId, embedding, matchCount = 6 } = params;
 
-  const rpcClient = supabase as unknown as {
-    rpc: (
-      fn: string,
-      args?: Record<string, unknown>
-    ) => Promise<{ data: RpcChunkMatch[] | null; error: { message: string } | null }>;
-  };
+  if (!bookId) {
+    throw new Error("bookId is required");
+  }
+
+  if (!Array.isArray(embedding) || embedding.length === 0) {
+    throw new Error("embedding is required");
+  }
+
+  const rpcClient = supabase as unknown as RpcClient;
 
   const { data, error } = await rpcClient.rpc("match_chunks", {
     query_embedding: embedding,
@@ -46,7 +59,7 @@ export async function searchBookChunks(params: {
     throw new Error(`Vector search failed: ${error.message}`);
   }
 
-  return (data ?? []).map((row: RpcChunkMatch) => ({
+  return (data ?? []).map((row) => ({
     id: row.id,
     book_id: row.book_id,
     chapter_id: row.chapter_id,

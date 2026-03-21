@@ -1,11 +1,18 @@
 import { pipeline } from "@huggingface/transformers";
 
-type EmbeddingExtractor = (input: string, options?: {
+type ExtractorOutput = {
+  data: Float32Array | number[];
+};
+
+type EmbeddingOptions = {
   pooling?: "mean";
   normalize?: boolean;
-}) => Promise<{
-  data: Float32Array | number[];
-}>;
+};
+
+type EmbeddingExtractor = (
+  input: string,
+  options?: EmbeddingOptions
+) => Promise<ExtractorOutput>;
 
 let embedder: EmbeddingExtractor | null = null;
 
@@ -26,13 +33,7 @@ async function getEmbedder(): Promise<EmbeddingExtractor> {
   return embedder;
 }
 
-export async function generateEmbedding(text: string): Promise<number[]> {
-  const input = cleanText(text);
-
-  if (!input) {
-    throw new Error("Cannot generate embedding for empty text");
-  }
-
+async function extractSingleEmbedding(input: string): Promise<number[]> {
   const extractor = await getEmbedder();
 
   const output = await extractor(input, {
@@ -40,26 +41,42 @@ export async function generateEmbedding(text: string): Promise<number[]> {
     normalize: true,
   });
 
-  return Array.from(output.data);
+  const vector = output?.data;
+
+  if (!vector) {
+    throw new Error("Embedding model returned no data");
+  }
+
+  return Array.from(vector);
+}
+
+export async function generateEmbedding(text: string): Promise<number[]> {
+  const input = cleanText(text);
+
+  if (!input) {
+    throw new Error("Cannot generate embedding for empty text");
+  }
+
+  return extractSingleEmbedding(input);
 }
 
 export async function generateEmbeddings(texts: string[]): Promise<number[][]> {
-  const inputs = texts.map(cleanText).filter(Boolean);
+  const cleaned = texts.map(cleanText);
 
-  if (inputs.length === 0) {
+  if (cleaned.length === 0) {
     return [];
   }
 
-  const extractor = await getEmbedder();
   const results: number[][] = [];
 
-  for (const input of inputs) {
-    const output = await extractor(input, {
-      pooling: "mean",
-      normalize: true,
-    });
+  for (const input of cleaned) {
+    if (!input) {
+      results.push([]);
+      continue;
+    }
 
-    results.push(Array.from(output.data));
+    const embedding = await extractSingleEmbedding(input);
+    results.push(embedding);
   }
 
   return results;

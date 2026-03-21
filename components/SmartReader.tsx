@@ -10,6 +10,14 @@ type SmartReaderProps = {
   text: string;
   audioUrl: string;
   initialCurrentTime?: number;
+  aiEnabled?: boolean;
+};
+
+type SimplifyResponse = {
+  success?: boolean;
+  error?: string;
+  simplified?: string | null;
+  message?: string;
 };
 
 export default function SmartReader({
@@ -20,6 +28,7 @@ export default function SmartReader({
   text,
   audioUrl,
   initialCurrentTime = 0,
+  aiEnabled = false,
 }: SmartReaderProps) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const activeSentenceRef = useRef<HTMLSpanElement | null>(null);
@@ -30,6 +39,7 @@ export default function SmartReader({
   const [activeParagraphIndex, setActiveParagraphIndex] = useState(0);
   const [simplifiedText, setSimplifiedText] = useState("");
   const [isSimplifying, setIsSimplifying] = useState(false);
+  const [simplifyError, setSimplifyError] = useState<string | null>(null);
 
   const paragraphs = useMemo(() => {
     return text
@@ -39,10 +49,12 @@ export default function SmartReader({
   }, [text]);
 
   const sentences = useMemo(() => {
-    return text
-      .match(/[^.!?]+[.!?]+|[^.!?]+$/g)
-      ?.map((sentence) => sentence.trim())
-      .filter(Boolean) ?? [];
+    return (
+      text
+        .match(/[^.!?]+[.!?]+|[^.!?]+$/g)
+        ?.map((sentence) => sentence.trim())
+        .filter(Boolean) ?? []
+    );
   }, [text]);
 
   useEffect(() => {
@@ -118,11 +130,17 @@ export default function SmartReader({
   };
 
   const handleSimplifyParagraph = async () => {
+    if (!aiEnabled) {
+      setSimplifyError("Simplify needs OpenAI and is currently unavailable.");
+      return;
+    }
+
     const paragraph = paragraphs[activeParagraphIndex];
-    if (!paragraph) return;
+    if (!paragraph || isSimplifying) return;
 
     setIsSimplifying(true);
     setSimplifiedText("");
+    setSimplifyError(null);
 
     try {
       const res = await fetch("/api/simplify", {
@@ -133,10 +151,18 @@ export default function SmartReader({
         body: JSON.stringify({ text: paragraph }),
       });
 
-      const data = await res.json();
+      const data = (await res.json()) as SimplifyResponse;
+
+      if (!res.ok) {
+        throw new Error(data.error || data.message || "Failed to simplify");
+      }
+
       setSimplifiedText(data.simplified || "");
     } catch (error) {
       console.error("SIMPLIFY_PARAGRAPH_ERROR", error);
+      setSimplifyError(
+        error instanceof Error ? error.message : "Failed to simplify paragraph"
+      );
     } finally {
       setIsSimplifying(false);
     }
@@ -177,7 +203,11 @@ export default function SmartReader({
             className="w-full"
             onTimeUpdate={handleTimeUpdate}
             onPause={() =>
-              void saveProgress(currentTime, activeSentenceIndex, activeParagraphIndex)
+              void saveProgress(
+                currentTime,
+                activeSentenceIndex,
+                activeParagraphIndex
+              )
             }
           />
 
@@ -216,12 +246,19 @@ export default function SmartReader({
             </button>
 
             <button
-              onClick={handleSimplifyParagraph}
-              className="rounded-xl border border-zinc-700 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-900"
+              onClick={() => void handleSimplifyParagraph()}
+              disabled={!aiEnabled || isSimplifying}
+              className="rounded-xl border border-zinc-700 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-900 disabled:opacity-50"
             >
               {isSimplifying ? "Simplifying..." : "Simplify paragraph"}
             </button>
           </div>
+
+          {!aiEnabled ? (
+            <p className="mt-4 text-sm text-zinc-400">
+              Simplify is unavailable because OpenAI is not configured.
+            </p>
+          ) : null}
 
           <div className="mt-4 rounded-xl bg-zinc-900 p-4">
             <p className="mb-2 text-sm font-medium text-zinc-400">
@@ -231,6 +268,10 @@ export default function SmartReader({
               {paragraphs[activeParagraphIndex] || "No paragraph found."}
             </p>
           </div>
+
+          {simplifyError ? (
+            <p className="mt-4 text-sm text-red-400">{simplifyError}</p>
+          ) : null}
 
           {simplifiedText ? (
             <div className="mt-4 rounded-xl bg-zinc-900 p-4">

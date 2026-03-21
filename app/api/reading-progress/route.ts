@@ -6,7 +6,7 @@ type ProgressBody = {
   bookId: string;
   chapterId: string;
   partOrder: number;
-  currentTime: number;
+  currentPosition: number;
 };
 
 type ProgressRow = {
@@ -15,7 +15,7 @@ type ProgressRow = {
   book_id: string;
   chapter_id: string;
   part_order: number;
-  current_time: number;
+  current_position: number;
   created_at: string | null;
   updated_at: string | null;
 };
@@ -41,7 +41,7 @@ export async function GET(request: NextRequest) {
     const { data, error } = await db
       .from("reading_progress")
       .select(
-        "id, user_id, book_id, chapter_id, part_order, current_time, created_at, updated_at"
+        "id, user_id, book_id, chapter_id, part_order, current_position, created_at, updated_at"
       )
       .eq("user_id", userId)
       .eq("book_id", bookId)
@@ -53,7 +53,7 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json({
       success: true,
-      progress: (data ?? null) as ProgressRow | null,
+      progress: (data ?? null) as unknown as ProgressRow | null,
     });
   } catch (error) {
     console.error("GET_READING_PROGRESS_ERROR", error);
@@ -67,7 +67,7 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   try {
     const body = (await request.json()) as ProgressBody;
-    const { userId, bookId, chapterId, partOrder, currentTime } = body;
+    const { userId, bookId, chapterId, partOrder, currentPosition } = body;
 
     if (!userId || !bookId || !chapterId) {
       return NextResponse.json(
@@ -75,6 +75,14 @@ export async function POST(request: NextRequest) {
         { status: 400 }
       );
     }
+
+    const safePartOrder =
+      Number.isFinite(partOrder) && partOrder > 0 ? Math.floor(partOrder) : 1;
+
+    const safeCurrentPosition =
+      Number.isFinite(currentPosition) && currentPosition >= 0
+        ? Math.floor(currentPosition)
+        : 0;
 
     const supabase = createServerSupabaseClient();
     const db = supabase as SupabaseServerClient;
@@ -86,8 +94,8 @@ export async function POST(request: NextRequest) {
           user_id: userId,
           book_id: bookId,
           chapter_id: chapterId,
-          part_order: partOrder || 1,
-          current_time: currentTime || 0,
+          part_order: safePartOrder,
+          current_position: safeCurrentPosition,
           updated_at: new Date().toISOString(),
         },
         {
@@ -95,7 +103,7 @@ export async function POST(request: NextRequest) {
         }
       )
       .select(
-        "id, user_id, book_id, chapter_id, part_order, current_time, created_at, updated_at"
+        "id, user_id, book_id, chapter_id, part_order, current_position, created_at, updated_at"
       )
       .single();
 
