@@ -11,6 +11,7 @@ type SmartReaderProps = {
   audioUrl: string;
   initialCurrentTime?: number;
   aiEnabled?: boolean;
+  startPage?: number;
 };
 
 type SimplifyResponse = {
@@ -29,9 +30,11 @@ export default function SmartReader({
   audioUrl,
   initialCurrentTime = 0,
   aiEnabled = false,
+  startPage,
 }: SmartReaderProps) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const activeSentenceRef = useRef<HTMLSpanElement | null>(null);
+  const lastSavedSecondRef = useRef<number>(-1);
 
   const [currentTime, setCurrentTime] = useState(initialCurrentTime);
   const [playbackRate, setPlaybackRate] = useState(1);
@@ -51,17 +54,26 @@ export default function SmartReader({
   const sentences = useMemo(() => {
     return (
       text
-        .match(/[^.!?]+[.!?]+|[^.!?]+$/g)
+        .match(/[^.!?\n]+[.!?]+|[^.!?\n]+$/g)
         ?.map((sentence) => sentence.trim())
         .filter(Boolean) ?? []
     );
   }, [text]);
 
   useEffect(() => {
-    if (audioRef.current) {
-      audioRef.current.currentTime = initialCurrentTime;
-    }
-  }, [initialCurrentTime]);
+    setCurrentTime(initialCurrentTime);
+    setActiveSentenceIndex(0);
+    setActiveParagraphIndex(0);
+    setSimplifiedText("");
+    setSimplifyError(null);
+    lastSavedSecondRef.current = -1;
+  }, [chapterId, initialCurrentTime, text]);
+
+  useEffect(() => {
+    if (!audioRef.current) return;
+    audioRef.current.currentTime = initialCurrentTime;
+    audioRef.current.playbackRate = playbackRate;
+  }, [initialCurrentTime, playbackRate]);
 
   useEffect(() => {
     activeSentenceRef.current?.scrollIntoView({
@@ -70,11 +82,11 @@ export default function SmartReader({
     });
   }, [activeSentenceIndex]);
 
-  const saveProgress = async (
+  async function saveProgress(
     time: number,
     sentenceIndex: number,
     paragraphIndex: number
-  ) => {
+  ) {
     try {
       await fetch("/api/listening-progress", {
         method: "POST",
@@ -93,9 +105,9 @@ export default function SmartReader({
     } catch (error) {
       console.error("SAVE_PROGRESS_ERROR", error);
     }
-  };
+  }
 
-  const handleTimeUpdate = () => {
+  function handleTimeUpdate() {
     const audio = audioRef.current;
     if (!audio || !audio.duration || sentences.length === 0) return;
 
@@ -107,29 +119,40 @@ export default function SmartReader({
       Math.floor((time / audio.duration) * sentences.length)
     );
 
-    const paragraphIndex = Math.min(
-      paragraphs.length - 1,
-      Math.floor((time / audio.duration) * paragraphs.length)
-    );
+    const paragraphIndex =
+      paragraphs.length > 0
+        ? Math.min(
+            paragraphs.length - 1,
+            Math.floor((time / audio.duration) * paragraphs.length)
+          )
+        : 0;
 
     setActiveSentenceIndex(sentenceIndex);
     setActiveParagraphIndex(paragraphIndex);
 
-    if (Math.floor(time) % 5 === 0) {
+    const wholeSecond = Math.floor(time);
+    if (wholeSecond > 0 && wholeSecond % 5 === 0 && wholeSecond !== lastSavedSecondRef.current) {
+      lastSavedSecondRef.current = wholeSecond;
       void saveProgress(time, sentenceIndex, paragraphIndex);
     }
-  };
+  }
 
-  const handleRepeatParagraph = () => {
+  function handleLoadedMetadata() {
+    if (!audioRef.current) return;
+    audioRef.current.currentTime = initialCurrentTime;
+    audioRef.current.playbackRate = playbackRate;
+  }
+
+  function handleRepeatParagraph() {
     const audio = audioRef.current;
     if (!audio || !audio.duration || paragraphs.length === 0) return;
 
     const startTime = (activeParagraphIndex / paragraphs.length) * audio.duration;
     audio.currentTime = startTime;
     void audio.play();
-  };
+  }
 
-  const handleSimplifyParagraph = async () => {
+  async function handleSimplifyParagraph() {
     if (!aiEnabled) {
       setSimplifyError("Simplify needs OpenAI and is currently unavailable.");
       return;
@@ -166,12 +189,17 @@ export default function SmartReader({
     } finally {
       setIsSimplifying(false);
     }
-  };
+  }
 
   return (
     <div className="grid gap-6 lg:grid-cols-[1fr_360px]">
       <div className="rounded-2xl border border-zinc-800 bg-zinc-950 p-6">
-        <h1 className="mb-4 text-2xl font-semibold text-white">{chapterTitle}</h1>
+        <div className="mb-4">
+          <h1 className="text-2xl font-semibold text-white">{chapterTitle}</h1>
+          {typeof startPage === "number" ? (
+            <p className="mt-2 text-sm text-zinc-400">Reading starts from page {startPage}</p>
+          ) : null}
+        </div>
 
         <div className="space-y-5 text-base leading-8 text-zinc-300">
           {sentences.map((sentence, index) => {
@@ -179,7 +207,7 @@ export default function SmartReader({
 
             return (
               <span
-                key={`${sentence}-${index}`}
+                key={`${chapterId}-${index}`}
                 ref={isActive ? activeSentenceRef : null}
                 className={
                   isActive
@@ -201,8 +229,16 @@ export default function SmartReader({
             src={audioUrl}
             controls
             className="w-full"
+            onLoadedMetadata={handleLoadedMetadata}
             onTimeUpdate={handleTimeUpdate}
             onPause={() =>
+              void saveProgress(
+                currentTime,
+                activeSentenceIndex,
+                activeParagraphIndex
+              )
+            }
+            onEnded={() =>
               void saveProgress(
                 currentTime,
                 activeSentenceIndex,
@@ -212,12 +248,16 @@ export default function SmartReader({
           />
 
           <div className="mt-4 flex items-center gap-2">
-            <label className="text-sm text-zinc-400">Speed</label>
+            <label className="text-sm text-zinc-400" htmlFor="playback-rate">
+              Speed
+            </label>
             <select
+              id="playback-rate"
               value={playbackRate}
               onChange={(e) => {
                 const rate = Number(e.target.value);
                 setPlaybackRate(rate);
+
                 if (audioRef.current) {
                   audioRef.current.playbackRate = rate;
                 }

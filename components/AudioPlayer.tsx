@@ -59,7 +59,7 @@ export default function AudioPlayer({
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const progressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const objectUrlRef = useRef<string | null>(null);
-  const hasAppliedProgressRef = useRef(false);
+  const savedProgressRef = useRef<ProgressRow | null>(null);
   const isSwitchingPartRef = useRef(false);
 
   const [currentPartIndex, setCurrentPartIndex] = useState(0);
@@ -68,6 +68,7 @@ export default function AudioPlayer({
   const [isGenerating, setIsGenerating] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [rate, setRate] = useState(1);
+  const [voiceName, setVoiceName] = useState("Kore");
   const [error, setError] = useState<string | null>(null);
   const [audioReady, setAudioReady] = useState(false);
   const [duration, setDuration] = useState(0);
@@ -98,13 +99,24 @@ export default function AudioPlayer({
     }
   }, []);
 
+  const clearProgressTimer = useCallback(() => {
+    if (progressTimerRef.current) {
+      clearInterval(progressTimerRef.current);
+      progressTimerRef.current = null;
+    }
+  }, []);
+
   const resetAudioElement = useCallback(() => {
     const audio = audioRef.current;
     if (!audio) return;
 
     audio.pause();
+    audio.onloadedmetadata = null;
+    audio.oncanplay = null;
+    audio.onerror = null;
     audio.removeAttribute("src");
     audio.load();
+
     setIsPlaying(false);
     setAudioReady(false);
     setDuration(0);
@@ -137,12 +149,11 @@ export default function AudioPlayer({
   const loadSavedProgress = useCallback(async () => {
     try {
       setIsLoading(true);
+      setError(null);
 
       const response = await fetch(
         `/api/reading-progress?userId=${encodeURIComponent(userId)}&bookId=${encodeURIComponent(bookId)}`,
-        {
-          cache: "no-store",
-        }
+        { cache: "no-store" }
       );
 
       const result = (await response.json()) as ReadingProgressResponse;
@@ -151,38 +162,55 @@ export default function AudioPlayer({
         throw new Error(result.error || "Failed to load reading progress");
       }
 
-      setSavedProgress(result.progress ?? null);
+      const progress = result.progress ?? null;
+      setSavedProgress(progress);
+      savedProgressRef.current = progress;
+
+      if (progress?.chapter_id === chapterId && segments.length > 0) {
+        const savedIndex = Math.max((progress.part_order ?? 1) - 1, 0);
+        const boundedIndex = Math.min(savedIndex, segments.length - 1);
+        setCurrentPartIndex(boundedIndex);
+      } else {
+        setCurrentPartIndex(0);
+      }
     } catch (err) {
       console.error(err);
       setError(err instanceof Error ? err.message : "Failed to load progress");
+      setSavedProgress(null);
+      savedProgressRef.current = null;
+      setCurrentPartIndex(0);
     } finally {
       setIsLoading(false);
     }
-  }, [userId, bookId]);
+  }, [userId, bookId, chapterId, segments.length]);
 
-  const generateAudioForCurrentPart = useCallback(
-    async (autoPlay = false) => {
-      if (!currentSegment?.text?.trim()) return;
+  const generateAudioForPart = useCallback(
+    async (segment: Segment, partOrder: number, autoPlay = false) => {
+      if (!segment?.text?.trim()) return;
 
       try {
         setIsGenerating(true);
         setError(null);
         setAudioReady(false);
 
+        clearProgressTimer();
         cleanupObjectUrl();
         resetAudioElement();
 
-        const response = await fetch("/api/tts", {
+        const response = await fetch("/api/tts/google", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            text: currentSegment.text,
-            rate,
-            partOrder: currentPartOrder,
+            text: segment.text,
+            voiceName,
+            model: "gemini-2.5-flash-preview-tts",
+            stylePrompt:
+              "Read this like a warm, natural audiobook narrator. Sound calm, expressive, smooth, and human. Do not sound robotic. Use gentle pauses and natural flow.",
             chapterId,
             bookId,
+            partOrder,
           }),
         });
 
@@ -198,30 +226,30 @@ export default function AudioPlayer({
         const audio = audioRef.current;
         if (!audio) return;
 
-        audio.src = objectUrl;
-        audio.playbackRate = rate;
-        audio.load();
+        audio.onloadedmetadata = async () => {
+          const freshAudio = audioRef.current;
+          if (!freshAudio) return;
 
-        const resumeTime =
-          savedProgress?.chapter_id === chapterId &&
-          savedProgress?.part_order === currentPartOrder
-            ? Math.max(0, savedProgress.current_time ?? 0)
-            : 0;
-
-        const onLoadedMetadata = async () => {
-          if (!audioRef.current) return;
+          const latestSaved = savedProgressRef.current;
+          const resumeTime =
+            latestSaved?.chapter_id === chapterId && latestSaved?.part_order === partOrder
+              ? Math.max(0, latestSaved.current_time ?? 0)
+              : 0;
 
           if (resumeTime > 0) {
-            audioRef.current.currentTime = resumeTime;
+            freshAudio.currentTime = resumeTime;
             setCurrentTime(resumeTime);
+          } else {
+            setCurrentTime(0);
           }
 
-          setDuration(Number.isFinite(audioRef.current.duration) ? audioRef.current.duration : 0);
+          setDuration(Number.isFinite(freshAudio.duration) ? freshAudio.duration : 0);
           setAudioReady(true);
 
           if (autoPlay) {
             try {
-              await audioRef.current.play();
+              freshAudio.playbackRate = rate;
+              await freshAudio.play();
             } catch (err) {
               console.error(err);
               setError("Playback failed.");
@@ -229,9 +257,14 @@ export default function AudioPlayer({
           }
         };
 
-        audio.onloadedmetadata = () => {
-          void onLoadedMetadata();
+        audio.onerror = () => {
+          setError("Audio failed to load.");
+          setIsGenerating(false);
         };
+
+        audio.src = objectUrl;
+        audio.playbackRate = rate;
+        audio.load();
       } catch (err) {
         console.error(err);
         setError(err instanceof Error ? err.message : "Failed to generate audio");
@@ -239,21 +272,20 @@ export default function AudioPlayer({
         setIsGenerating(false);
       }
     },
-    [
-      bookId,
-      chapterId,
-      cleanupObjectUrl,
-      currentPartOrder,
-      currentSegment,
-      rate,
-      resetAudioElement,
-      savedProgress,
-    ]
+    [bookId, chapterId, cleanupObjectUrl, clearProgressTimer, rate, resetAudioElement, voiceName]
+  );
+
+  const generateAudioForCurrentPart = useCallback(
+    async (autoPlay = false) => {
+      if (!currentSegment) return;
+      await generateAudioForPart(currentSegment, currentPartOrder, autoPlay);
+    },
+    [currentSegment, currentPartOrder, generateAudioForPart]
   );
 
   const playAudio = useCallback(async () => {
     const audio = audioRef.current;
-    if (!audio) return;
+    if (!audio || !currentSegment) return;
 
     if (!audioReady || !audio.src) {
       await generateAudioForCurrentPart(true);
@@ -267,7 +299,7 @@ export default function AudioPlayer({
       console.error(err);
       setError("Playback failed.");
     }
-  }, [audioReady, generateAudioForCurrentPart, rate]);
+  }, [audioReady, currentSegment, generateAudioForCurrentPart, rate]);
 
   const pauseAudio = useCallback(async () => {
     const audio = audioRef.current;
@@ -283,26 +315,43 @@ export default function AudioPlayer({
       if (nextIndex < 0 || nextIndex >= segments.length) return;
 
       const audio = audioRef.current;
+      const wasPlaying = audio ? !audio.paused : false;
+
       if (audio) {
+        await saveProgress(currentPartOrder, audio.currentTime);
         audio.pause();
       }
 
+      clearProgressTimer();
       cleanupObjectUrl();
       resetAudioElement();
-      setSavedProgress((prev) => {
-        if (!prev || prev.chapter_id !== chapterId) return prev;
-        return {
-          ...prev,
-          part_order: nextIndex + 1,
-          current_time: 0,
-        };
-      });
 
-      isSwitchingPartRef.current = autoPlay;
+      isSwitchingPartRef.current = autoPlay || wasPlaying;
       setCurrentPartIndex(nextIndex);
+
+      const nextProgress =
+        savedProgressRef.current && savedProgressRef.current.chapter_id === chapterId
+          ? {
+              ...savedProgressRef.current,
+              part_order: nextIndex + 1,
+              current_time: 0,
+            }
+          : savedProgressRef.current;
+
+      setSavedProgress(nextProgress);
+      savedProgressRef.current = nextProgress;
+
       await saveProgress(nextIndex + 1, 0);
     },
-    [chapterId, cleanupObjectUrl, resetAudioElement, saveProgress, segments.length]
+    [
+      chapterId,
+      cleanupObjectUrl,
+      clearProgressTimer,
+      currentPartOrder,
+      resetAudioElement,
+      saveProgress,
+      segments.length,
+    ]
   );
 
   function nextPart() {
@@ -316,6 +365,10 @@ export default function AudioPlayer({
   }
 
   useEffect(() => {
+    savedProgressRef.current = savedProgress;
+  }, [savedProgress]);
+
+  useEffect(() => {
     void loadSavedProgress();
   }, [loadSavedProgress]);
 
@@ -325,50 +378,22 @@ export default function AudioPlayer({
   }, [currentPartOrder, onPartChange]);
 
   useEffect(() => {
-    if (!savedProgress || hasAppliedProgressRef.current || segments.length === 0) {
-      return;
-    }
-
-    if (savedProgress.chapter_id !== chapterId) {
-      return;
-    }
-
-    const savedIndex = Math.max((savedProgress.part_order ?? 1) - 1, 0);
-    const boundedIndex = Math.min(savedIndex, segments.length - 1);
-
-    setCurrentPartIndex(boundedIndex);
-    hasAppliedProgressRef.current = true;
-  }, [savedProgress, segments, chapterId]);
-
-  useEffect(() => {
-    hasAppliedProgressRef.current = false;
-    setSavedProgress(null);
-    setError(null);
-    cleanupObjectUrl();
-    resetAudioElement();
-  }, [chapterId, cleanupObjectUrl, resetAudioElement]);
-
-  useEffect(() => {
-    if (!currentSegment) return;
+    if (!currentSegment || isLoading) return;
 
     const autoPlay = isSwitchingPartRef.current;
     isSwitchingPartRef.current = false;
 
-    void generateAudioForCurrentPart(autoPlay);
-  }, [currentSegment, generateAudioForCurrentPart]);
+    void generateAudioForPart(currentSegment, currentPartOrder, autoPlay);
+  }, [currentSegment, currentPartOrder, generateAudioForPart, isLoading]);
 
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
-
     audio.playbackRate = rate;
-  }, [rate, audioReady]);
+  }, [rate]);
 
   useEffect(() => {
-    if (progressTimerRef.current) {
-      clearInterval(progressTimerRef.current);
-      progressTimerRef.current = null;
-    }
+    clearProgressTimer();
 
     if (!isPlaying) return;
 
@@ -379,22 +404,17 @@ export default function AudioPlayer({
     }, 5000);
 
     return () => {
-      if (progressTimerRef.current) {
-        clearInterval(progressTimerRef.current);
-        progressTimerRef.current = null;
-      }
+      clearProgressTimer();
     };
-  }, [isPlaying, saveProgress, currentPartOrder]);
+  }, [isPlaying, saveProgress, currentPartOrder, clearProgressTimer]);
 
   useEffect(() => {
     return () => {
-      if (progressTimerRef.current) {
-        clearInterval(progressTimerRef.current);
-      }
+      clearProgressTimer();
       cleanupObjectUrl();
       resetAudioElement();
     };
-  }, [cleanupObjectUrl, resetAudioElement]);
+  }, [cleanupObjectUrl, clearProgressTimer, resetAudioElement]);
 
   return (
     <div className="rounded-2xl border border-zinc-800 bg-zinc-950 p-4">
@@ -409,20 +429,36 @@ export default function AudioPlayer({
         <p className="text-sm text-zinc-400">Loading progress...</p>
       ) : (
         <div className="space-y-4">
-          <div>
-            <label className="mb-2 block text-xs text-zinc-500">Speed</label>
-            <select
-              value={String(rate)}
-              onChange={(e) => setRate(Number(e.target.value))}
-              className="w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm text-white outline-none"
-            >
-              <option value="0.75">0.75x</option>
-              <option value="1">1x</option>
-              <option value="1.25">1.25x</option>
-              <option value="1.5">1.5x</option>
-              <option value="1.75">1.75x</option>
-              <option value="2">2x</option>
-            </select>
+          <div className="grid gap-3 md:grid-cols-2">
+            <div>
+              <label className="mb-2 block text-xs text-zinc-500">Speed</label>
+              <select
+                value={String(rate)}
+                onChange={(e) => setRate(Number(e.target.value))}
+                className="w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm text-white outline-none"
+              >
+                <option value="0.75">0.75x</option>
+                <option value="1">1x</option>
+                <option value="1.25">1.25x</option>
+                <option value="1.5">1.5x</option>
+                <option value="1.75">1.75x</option>
+                <option value="2">2x</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="mb-2 block text-xs text-zinc-500">Voice</label>
+              <select
+                value={voiceName}
+                onChange={(e) => setVoiceName(e.target.value)}
+                className="w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm text-white outline-none"
+              >
+                <option value="Kore">Kore</option>
+                <option value="Aoede">Aoede</option>
+                <option value="Callirrhoe">Callirrhoe</option>
+                <option value="Puck">Puck</option>
+              </select>
+            </div>
           </div>
 
           <audio

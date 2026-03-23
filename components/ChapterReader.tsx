@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import AudioPlayer from "@/components/AudioPlayer";
 
 type ChapterLink = {
@@ -19,6 +20,7 @@ type ChapterReaderProps = {
   aiEnabled: boolean;
   previousChapter: ChapterLink;
   nextChapter: ChapterLink;
+  startPage?: number;
 };
 
 type Segment = {
@@ -42,9 +44,12 @@ export default function ChapterReader({
   text,
   previousChapter,
   nextChapter,
+  startPage,
 }: ChapterReaderProps) {
-  const [currentPartOrder, setCurrentPartOrder] = useState(1);
+  const searchParams = useSearchParams();
   const activeRef = useRef<HTMLParagraphElement | null>(null);
+
+  const [currentPartOrder, setCurrentPartOrder] = useState(1);
 
   const safeText = useMemo(() => text?.trim() || "", [text]);
 
@@ -66,6 +71,35 @@ export default function ChapterReader({
     return Math.min(Math.max(currentPartOrder - 1, 0), segments.length - 1);
   }, [currentPartOrder, segments.length]);
 
+  const startPageParam = searchParams.get("startPage");
+  const parsedStartPage = startPageParam ? Number(startPageParam) : undefined;
+  const startPageValue =
+    typeof startPage === "number"
+      ? startPage
+      : typeof parsedStartPage === "number" && Number.isFinite(parsedStartPage)
+        ? parsedStartPage
+        : undefined;
+
+  const previousHref = useMemo(() => {
+    if (!previousChapter) return null;
+
+    if (startPageValue) {
+      return `/books/${bookId}/chapters/${previousChapter.id}?startPage=${startPageValue}`;
+    }
+
+    return `/books/${bookId}/chapters/${previousChapter.id}`;
+  }, [previousChapter, bookId, startPageValue]);
+
+  const nextHref = useMemo(() => {
+    if (!nextChapter) return null;
+
+    if (startPageValue) {
+      return `/books/${bookId}/chapters/${nextChapter.id}?startPage=${startPageValue}`;
+    }
+
+    return `/books/${bookId}/chapters/${nextChapter.id}`;
+  }, [nextChapter, bookId, startPageValue]);
+
   useEffect(() => {
     if (activeRef.current) {
       activeRef.current.scrollIntoView({
@@ -85,6 +119,11 @@ export default function ChapterReader({
             </p>
             <h1 className="mt-1 text-2xl font-semibold text-white">{title}</h1>
             <p className="mt-2 text-sm text-zinc-400">{bookTitle}</p>
+            {startPageValue ? (
+              <p className="mt-2 text-sm text-zinc-500">
+                Reading starts from page {startPageValue}
+              </p>
+            ) : null}
           </div>
 
           <div className="rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm text-zinc-300">
@@ -94,6 +133,7 @@ export default function ChapterReader({
 
         <div className="mt-5">
           <AudioPlayer
+            key={chapterId}
             userId={userId}
             bookId={bookId}
             chapterId={chapterId}
@@ -140,9 +180,9 @@ export default function ChapterReader({
       </div>
 
       <div className="grid gap-4 md:grid-cols-2">
-        {previousChapter ? (
+        {previousChapter && previousHref ? (
           <Link
-            href={`/books/${bookId}/chapters/${previousChapter.id}`}
+            href={previousHref}
             className="rounded-2xl border border-zinc-800 bg-zinc-950 p-4 transition hover:border-zinc-700 hover:bg-zinc-900"
           >
             <p className="text-xs uppercase tracking-[0.2em] text-zinc-500">
@@ -163,9 +203,9 @@ export default function ChapterReader({
           </div>
         )}
 
-        {nextChapter ? (
+        {nextChapter && nextHref ? (
           <Link
-            href={`/books/${bookId}/chapters/${nextChapter.id}`}
+            href={nextHref}
             className="rounded-2xl border border-zinc-800 bg-zinc-950 p-4 text-left transition hover:border-zinc-700 hover:bg-zinc-900"
           >
             <p className="text-xs uppercase tracking-[0.2em] text-zinc-500">

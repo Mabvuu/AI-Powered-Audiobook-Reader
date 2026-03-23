@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@andresaya/edge-tts": "^1.8.0",
+    "@google/genai": "^1.46.0",
     "@huggingface/transformers": "^3.8.1",
     "@langchain/core": "^1.1.31",
     "@langchain/openai": "^1.2.12",
