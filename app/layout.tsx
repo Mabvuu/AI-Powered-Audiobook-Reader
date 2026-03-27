@@ -14,9 +14,11 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body className="bg-zinc-950 text-white antialiased">
-        <Navbar />
-        {children}
+      <body className="min-h-screen w-full bg-zinc-950 text-white antialiased">
+        <div className="min-h-screen w-full">
+          <Navbar />
+          {children}
+        </div>
       </body>
     </html>
   );

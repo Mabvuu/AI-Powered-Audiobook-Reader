@@ -70,16 +70,18 @@ export default async function ChapterPage({ params }: PageProps) {
     currentIndex < chapters.length - 1 ? chapters[currentIndex + 1] : null;
 
   return (
-    <main className="min-h-screen bg-black px-4 py-8 text-white">
-      <div className="mx-auto max-w-5xl">
-        <div className="mb-6 rounded-2xl border border-zinc-800 bg-zinc-950 p-4">
-          <p className="text-xs uppercase tracking-wide text-zinc-500">
+    <main className="min-h-screen w-full bg-black text-white">
+      <div className="w-full px-4 py-6 md:px-6 lg:px-8">
+        <div className="mb-6 rounded-3xl border border-zinc-800 bg-zinc-950/95 p-5 shadow-2xl">
+          <p className="text-xs uppercase tracking-[0.25em] text-zinc-500">
             {book.title ?? "Untitled Book"}
           </p>
-          <h1 className="mt-1 text-2xl font-semibold">
+
+          <h1 className="mt-2 text-2xl font-semibold tracking-tight md:text-3xl">
             {chapter.title ?? "Untitled Chapter"}
           </h1>
-          <p className="mt-2 text-sm text-zinc-400">
+
+          <p className="mt-3 text-sm text-zinc-400">
             Chapter {chapter.chapter_order ?? currentIndex + 1} of {chapters.length}
           </p>
         </div>
